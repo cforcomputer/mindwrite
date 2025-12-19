@@ -1,6 +1,9 @@
 {
-  "typewriter_mode": false,
+  "typewriter_mode": true,
+  "room_mode": true,
+  "font_size": 15,
+  "tracking": 1,
   "auto_capitalize_i": true,
-  "always_double_quotes": false,
+  "always_double_quotes": true,
   "autocap_after_period": true
 }
