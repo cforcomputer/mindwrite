@@ -42,12 +42,11 @@ class MindPalaceEmulator:
 
         # Settings (persisted)
         self.settings = {
-            "typewriter_mode": False,        # if on: no backspace editing
-            "room_mode": False,              # if on: draw 3D room + floating panel
+            "typewriter_mode": False,        # if on: limited per-char overwrite (no backspace editing)
+            "room_mode": False,              # if on: enclosed 3D room behind fixed HUD panel
             "font_size": 14,                 # CTRL+F then ←/→ ; CTRL+S saves
             "tracking": 1,                   # typewriter-ish letter spacing
             "auto_capitalize_i": False,
-            "always_double_quotes": False,
             "autocap_after_period": False,
         }
         self._load_settings()
@@ -58,7 +57,7 @@ class MindPalaceEmulator:
         self.font_ui = None  # fixed UI font (does NOT change with font_size)
         self.line_height = 20
 
-        # Apply fonts from settings (safe now that min/max exist)
+        # Apply fonts from settings
         self._apply_font_settings()
 
         # Precomputed vignette masks (generated once; runtime is just a blit)
@@ -70,18 +69,55 @@ class MindPalaceEmulator:
         )
         self.room_mask = self._generate_smooth_vignette_mask(
             EYE_WIDTH, EYE_HEIGHT,
-            clear_radius_ratio=0.60,   # further out than portal mode
+            clear_radius_ratio=0.60,
             fade_width_px=130,
             small_base=160
         )
 
-        # Pre-rendered room background and precomputed panel polygon
+        # --- Room look (gyro sim) ---
+        self.mouse_look_enabled = True
+        self.mouse_look_quant_step = 0.010  # radians; bigger = fewer rebuilds
+
+        self.room_yaw = 0.0
+        self.room_pitch = 0.0
+
+        # Wider now that the room is fully enclosed
+        self.room_yaw_limit = 0.75
+        self.room_pitch_limit = 0.35
+
+        # Optional key nudges (CTRL+arrows)
+        self.room_yaw_step = 0.045
+        self.room_pitch_step = 0.035
+
+        # --- Room size + camera placement inside the room ---
+        # Wider / taller a bit, and much deeper forward.
+        self.room_half_w = 3.2
+        self.room_half_h = 2.1
+        self.room_half_d = 5.2
+
+        # Camera height above the floor (smaller = closer to floor)
+        self.cam_height = 1.10
+
+        # Shift camera toward the back wall so the front wall feels farther away
+        self.cam_back_bias = 0.35
+
+        # Derived camera position (inside the box)
+        self.cam_x = 0.0
+        self.cam_y = -self.room_half_h + self.cam_height
+        self.cam_z = -self.room_half_d * self.cam_back_bias
+
+        # Pre-rendered room background (rebuild only when pose changes)
         self.room_bg = pygame.Surface((EYE_WIDTH, EYE_HEIGHT), flags=0)
-        self.room_panel_poly = None
-        self.room_panel_rect = None
         self._build_room_static()
 
-        # Shadow surface (alpha) for floating panel
+        # Fixed HUD panel (text stays pinned on-screen even as room moves)
+        panel_w = int(EYE_WIDTH * 0.74)
+        panel_h = int(EYE_HEIGHT * 0.58)
+        panel_x = (EYE_WIDTH - panel_w) // 2
+        panel_y = (EYE_HEIGHT - panel_h) // 2 + 8
+        self.hud_panel_rect = pygame.Rect(panel_x, panel_y, panel_w, panel_h)
+
+        # Shadow surface (alpha) for panel
         self.panel_shadow_surf = pygame.Surface((EYE_WIDTH, EYE_HEIGHT), pygame.SRCALPHA)
 
         # Typewriter layout baseline below center
@@ -99,6 +135,12 @@ class MindPalaceEmulator:
         self.capsule_files = []
         self.browser_index = 0
 
+        # Browser scrolling so the list never goes off-screen
+        self.browser_scroll = 0
+        self.browser_row_h = 25
+        self.browser_top_y = 50
+        self.browser_bottom_pad = 18
+
         self.notes = [""]
         self.status_msg = ""   # errors only
         self.msg_timer = 0
@@ -110,17 +152,20 @@ class MindPalaceEmulator:
 
         self.scroll_lines = 0
 
+        # Typewriter selection (single-character highlight)
+        self.tw_sel_line = None
+        self.tw_sel_char = None
+
         self.settings_items = [
             ("Typewriter mode", "typewriter_mode"),
             ("Room", "room_mode"),
             ("Auto capitalize \"i\"", "auto_capitalize_i"),
-            ("Always use double quotes", "always_double_quotes"),
             ("Autocapitalize after a .", "autocap_after_period"),
             ("Back", None),
         ]
         self.settings_index = 0
 
-        # Backspace repeat
+        # Backspace repeat (non-typewriter mode only)
         self.backspace_down = False
         self.backspace_hold_start = 0
         self.backspace_next_repeat = 0
@@ -201,7 +246,6 @@ class MindPalaceEmulator:
 
         self.line_height = int(body_size * 1.25) + 6
 
-        # Rebuild glyph cache when font changes
         if hasattr(self, "_glyph_surf"):
             self._rebuild_glyph_cache()
 
@@ -240,25 +284,82 @@ class MindPalaceEmulator:
         return pygame.transform.smoothscale(small, (w, h))
 
     # -----------------------
-    # Room: pre-rendered 3D box + floating panel
-    # Uses pygame.draw.aaline (gfxdraw.aaline doesn't exist in your build)
+    # Room rendering (ENCLOSED ROOM AROUND CAMERA)
+    # - Room is a rectangular prism centered on origin
+    # - Camera is positioned inside it (near floor, biased toward back wall)
+    # - World is rotated by inverse camera rotation (-yaw, -pitch)
+    # - Polygons clipped against near plane
     # -----------------------
-    def _project(self, x, y, z, cx, cy, f):
-        if z <= 0.05:
-            z = 0.05
+    def _project(self, x, y, z, cx, cy, f, near_z):
+        if z < near_z:
+            z = near_z
         sx = cx + (x * f / z)
-        sy = cy + (y * f / z)
+        sy = cy - (y * f / z)  # <-- IMPORTANT: flip Y so +Y is up
         return (int(round(sx)), int(round(sy)))
 
-    def _draw_closed_aapoly(self, surf, pts, color):
-        # aapolygon exists; draw polygon outline too for crisp corner connections
-        pygame.gfxdraw.aapolygon(surf, pts, color)
-        pygame.draw.polygon(surf, color, pts, width=1)
+    def _camera_space(self, x, y, z):
+        # Translate world by camera position (camera is inside the room)
+        x -= self.cam_x
+        y -= self.cam_y
+        z -= self.cam_z
 
-    def _draw_aaline(self, surf, p1, p2, color):
-        # Use pygame.draw.aaline (available in pygame 2.6.1)
-        pygame.draw.aaline(surf, color, p1, p2)
-        pygame.draw.line(surf, color, p1, p2, 1)
+        # Apply inverse camera rotation
+        yaw = -self.room_yaw
+        pitch = -self.room_pitch
+
+        cy = math.cos(yaw)
+        sy = math.sin(yaw)
+        x1 = x * cy + z * sy
+        z1 = -x * sy + z * cy
+
+        cp = math.cos(pitch)
+        sp = math.sin(pitch)
+        y2 = y * cp - z1 * sp
+        z2 = y * sp + z1 * cp
+
+        return (x1, y2, z2)
+
+    def _intersect_z(self, a, b, near_z):
+        ax, ay, az = a
+        bx, by, bz = b
+        dz = (bz - az)
+        if abs(dz) < 1e-9:
+            return (ax, ay, near_z)
+        t = (near_z - az) / dz
+        x = ax + t * (bx - ax)
+        y = ay + t * (by - ay)
+        return (x, y, near_z)
+
+    def _clip_poly_near_z(self, poly3d, near_z):
+        # Sutherland–Hodgman clip against plane z >= near_z
+        if not poly3d:
+            return []
+        out = []
+        prev = poly3d[-1]
+        prev_in = (prev[2] >= near_z)
+
+        for curr in poly3d:
+            curr_in = (curr[2] >= near_z)
+
+            if prev_in and curr_in:
+                out.append(curr)
+            elif prev_in and not curr_in:
+                out.append(self._intersect_z(prev, curr, near_z))
+            elif (not prev_in) and curr_in:
+                out.append(self._intersect_z(prev, curr, near_z))
+                out.append(curr)
+
+            prev = curr
+            prev_in = curr_in
+
+        return out
+
+    def _draw_poly(self, surf, pts2d, fill_color, edge_color):
+        if len(pts2d) < 3:
+            return
+        pygame.gfxdraw.filled_polygon(surf, pts2d, fill_color)
+        pygame.gfxdraw.aapolygon(surf, pts2d, edge_color)
+        pygame.draw.polygon(surf, edge_color, pts2d, width=1)
 
     def _build_room_static(self):
         w, h = EYE_WIDTH, EYE_HEIGHT
@@ -267,79 +368,103 @@ class MindPalaceEmulator:
 
         cx, cy = w // 2, h // 2
         f = 260
+        near_z = 0.12
 
-        room_w = 2.2
-        room_h = 1.65
-        room_d = 4.2
+        sx = float(self.room_half_w)
+        sy = float(self.room_half_h)
+        sz = float(self.room_half_d)
 
-        z_near = 1.6
-        z_far = z_near + room_d
+        # Box vertices (room centered at origin; camera offset handled in _camera_space)
+        V = {
+            "lbf": (-sx, -sy, +sz),
+            "rbf": (+sx, -sy, +sz),
+            "rtf": (+sx, +sy, +sz),
+            "ltf": (-sx, +sy, +sz),
 
-        nlt = (-room_w,  room_h, z_near)
-        nrt = ( room_w,  room_h, z_near)
-        nrb = ( room_w, -room_h, z_near)
-        nlb = (-room_w, -room_h, z_near)
+            "lbb": (-sx, -sy, -sz),
+            "rbb": (+sx, -sy, -sz),
+            "rtb": (+sx, +sy, -sz),
+            "ltb": (-sx, +sy, -sz),
+        }
 
-        flt = (-room_w,  room_h, z_far)
-        frt = ( room_w,  room_h, z_far)
-        frb = ( room_w, -room_h, z_far)
-        flb = (-room_w, -room_h, z_far)
-
-        P = {}
-        for name, v in zip(
-            ["nlt", "nrt", "nrb", "nlb", "flt", "frt", "frb", "flb"],
-            [nlt,  nrt,  nrb,  nlb,  flt,  frt,  frb,  flb]
-        ):
-            P[name] = self._project(v[0], v[1], v[2], cx, cy, f)
-
-        # Faces
-        pygame.draw.polygon(surf, (252, 252, 252), [P["flt"], P["frt"], P["frb"], P["flb"]])  # back
-        pygame.draw.polygon(surf, (248, 248, 248), [P["nlb"], P["nrb"], P["frb"], P["flb"]])  # floor
-        pygame.draw.polygon(surf, (251, 251, 251), [P["nlt"], P["nrt"], P["frt"], P["flt"]])  # ceiling
-        pygame.draw.polygon(surf, (249, 249, 249), [P["nlt"], P["nlb"], P["flb"], P["flt"]])  # left
-        pygame.draw.polygon(surf, (249, 249, 249), [P["nrt"], P["nrb"], P["frb"], P["frt"]])  # right
+        faces = [
+            ("front",  ["ltf", "rtf", "rbf", "lbf"], (252, 252, 252)),
+            ("back",   ["ltb", "lbb", "rbb", "rtb"], (252, 252, 252)),
+            ("left",   ["ltb", "ltf", "lbf", "lbb"], (249, 249, 249)),
+            ("right",  ["rtf", "rtb", "rbb", "rbf"], (249, 249, 249)),
+            ("ceiling",["ltb", "rtb", "rtf", "ltf"], (251, 251, 251)),
+            ("floor",  ["lbf", "rbf", "rbb", "lbb"], (248, 248, 248)),
+        ]
 
         edge = (238, 238, 238)
 
-        near_poly = [P["nlt"], P["nrt"], P["nrb"], P["nlb"]]
-        far_poly = [P["flt"], P["frt"], P["frb"], P["flb"]]
+        drawable = []
+        for _, idxs, fill in faces:
+            poly_cam = []
+            for name in idxs:
+                x, y, z = V[name]
+                poly_cam.append(self._camera_space(x, y, z))
 
-        self._draw_closed_aapoly(surf, near_poly, edge)
-        self._draw_closed_aapoly(surf, far_poly, edge)
+            poly_cam = self._clip_poly_near_z(poly_cam, near_z)
+            if len(poly_cam) < 3:
+                continue
 
-        self._draw_aaline(surf, P["nlt"], P["flt"], edge)
-        self._draw_aaline(surf, P["nrt"], P["frt"], edge)
-        self._draw_aaline(surf, P["nrb"], P["frb"], edge)
-        self._draw_aaline(surf, P["nlb"], P["flb"], edge)
+            avg_z = sum(p[2] for p in poly_cam) / float(len(poly_cam))
+            pts2d = [self._project(p[0], p[1], p[2], cx, cy, f, near_z) for p in poly_cam]
+            drawable.append((avg_z, pts2d, fill))
 
-        # Floating panel straight-on (no slant)
-        panel_z = 2.1
-        panel_w = 1.45
-        panel_h = 0.90
-        panel_center_y = -0.18
+        drawable.sort(key=lambda t: t[0], reverse=True)
+        for _, pts2d, fill in drawable:
+            self._draw_poly(surf, pts2d, fill, edge)
 
-        corners = [
-            (-panel_w,  panel_h, panel_z),
-            ( panel_w,  panel_h, panel_z),
-            ( panel_w, -panel_h, panel_z),
-            (-panel_w, -panel_h, panel_z),
-        ]
+    def _quantize(self, v, step):
+        if step <= 0:
+            return v
+        return round(v / step) * step
 
-        poly = []
-        for x, y, z in corners:
-            poly.append(self._project(x, y + panel_center_y, z, cx, cy, f))
+    def _update_mouse_look(self):
+        if not self.mouse_look_enabled:
+            return
+        if self.state != "WRITING":
+            return
+        if not self.settings["room_mode"]:
+            return
 
-        self.room_panel_poly = poly
-        self.room_panel_rect = pygame.Rect(
-            min(p[0] for p in poly),
-            min(p[1] for p in poly),
-            max(p[0] for p in poly) - min(p[0] for p in poly),
-            max(p[1] for p in poly) - min(p[1] for p in poly),
-        )
+        mx, my = pygame.mouse.get_pos()
+
+        nx = (mx / float(max(1, WINDOW_WIDTH))) * 2.0 - 1.0    # -1..+1
+        ny = (my / float(max(1, WINDOW_HEIGHT))) * 2.0 - 1.0   # -1..+1
+
+        target_yaw = nx * self.room_yaw_limit
+        target_pitch = -ny * self.room_pitch_limit
+
+        qyaw = self._quantize(target_yaw, self.mouse_look_quant_step)
+        qpitch = self._quantize(target_pitch, self.mouse_look_quant_step)
+
+        if abs(qyaw - self.room_yaw) > 1e-9 or abs(qpitch - self.room_pitch) > 1e-9:
+            self.room_yaw = max(-self.room_yaw_limit, min(self.room_yaw_limit, qyaw))
+            self.room_pitch = max(-self.room_pitch_limit, min(self.room_pitch_limit, qpitch))
+            self._build_room_static()
+
+    def _adjust_room_view(self, dyaw=0.0, dpitch=0.0):
+        changed = False
+        if dyaw:
+            ny = self.room_yaw + dyaw
+            ny = max(-self.room_yaw_limit, min(self.room_yaw_limit, ny))
+            if abs(ny - self.room_yaw) > 1e-9:
+                self.room_yaw = ny
+                changed = True
+        if dpitch:
+            np = self.room_pitch + dpitch
+            np = max(-self.room_pitch_limit, min(self.room_pitch_limit, np))
+            if abs(np - self.room_pitch) > 1e-9:
+                self.room_pitch = np
+                changed = True
+        if changed:
+            self._build_room_static()
 
     # -----------------------
     # Overlay (unmasked): errors, CAPS, font-adjust hint only
-    # NOTE: No "ROOM" label anywhere.
     # -----------------------
     def _notify_error(self, msg):
         self.status_msg = msg
@@ -514,6 +639,72 @@ class MindPalaceEmulator:
             self._mark_edited()
 
     # -----------------------
+    # Typewriter selection / overwrite
+    # -----------------------
+    def _tw_clear_selection(self):
+        self.tw_sel_line = None
+        self.tw_sel_char = None
+
+    def _tw_has_selection(self):
+        return self.tw_sel_line is not None and self.tw_sel_char is not None
+
+    def _tw_move_left(self):
+        if not self._tw_has_selection():
+            li = len(self.notes) - 1
+            while li >= 0:
+                if self.notes[li]:
+                    self.tw_sel_line = li
+                    self.tw_sel_char = len(self.notes[li]) - 1
+                    return
+                li -= 1
+            return
+
+        li = self.tw_sel_line
+        ci = self.tw_sel_char
+
+        if li is None or ci is None:
+            return
+
+        if ci > 0:
+            self.tw_sel_char = ci - 1
+            return
+
+        li -= 1
+        while li >= 0:
+            if self.notes[li]:
+                self.tw_sel_line = li
+                self.tw_sel_char = len(self.notes[li]) - 1
+                return
+            li -= 1
+
+        self.tw_sel_line = 0
+        self.tw_sel_char = 0
+
+    def _tw_move_right(self):
+        if not self._tw_has_selection():
+            return
+
+        li = self.tw_sel_line
+        ci = self.tw_sel_char
+
+        if li is None or ci is None:
+            return
+
+        if ci < len(self.notes[li]) - 1:
+            self.tw_sel_char = ci + 1
+            return
+
+        li += 1
+        while li < len(self.notes):
+            if self.notes[li]:
+                self.tw_sel_line = li
+                self.tw_sel_char = 0
+                return
+            li += 1
+
+        self._tw_clear_selection()
+
+    # -----------------------
     # Text helpers / settings logic
     # -----------------------
     def _get_last_non_space_char(self):
@@ -524,19 +715,75 @@ class MindPalaceEmulator:
                     return s[ci]
         return None
 
+    def _get_prev_non_space_char_before(self, line_index, char_index):
+        """
+        Returns the previous non-space character BEFORE (line_index, char_index),
+        scanning backwards across lines if needed.
+        - char_index is exclusive: we start from char_index-1 on that line.
+        """
+        li = line_index
+        if li is None:
+            return None
+        li = max(0, min(li, len(self.notes) - 1))
+
+        ci = char_index - 1
+        while li >= 0:
+            s = self.notes[li]
+            if ci >= len(s):
+                ci = len(s) - 1
+            while ci >= 0:
+                if not s[ci].isspace():
+                    return s[ci]
+                ci -= 1
+            li -= 1
+            if li >= 0:
+                ci = len(self.notes[li]) - 1
+        return None
+
     def _should_autocapitalize_next_letter(self):
         if not self.settings["autocap_after_period"]:
             return False
         return self._get_last_non_space_char() == "."
 
-    def _apply_auto_i_on_boundary(self):
+    def _should_autocapitalize_next_letter_at(self, line_index, char_index):
+        """
+        Like _should_autocapitalize_next_letter(), but works at an arbitrary cursor
+        position (needed for typewriter-mode overwrites).
+        """
+        if not self.settings["autocap_after_period"]:
+            return False
+        prev = self._get_prev_non_space_char_before(line_index, char_index)
+        return prev == "."
+
+    def _apply_auto_i_on_boundary_at(self, line_index, boundary_pos):
+        """
+        If the word immediately before boundary_pos is exactly 'i' as a standalone word,
+        replace it with 'I'. Works in the middle of a line (typewriter mode) and at end.
+        boundary_pos should be the index of the boundary character in that line.
+        """
         if not self.settings["auto_capitalize_i"]:
             return
-        line = self.notes[-1]
+        if line_index is None or line_index < 0 or line_index >= len(self.notes):
+            return
+
+        line = self.notes[line_index]
         if not line:
             return
 
-        i = len(line) - 1
+        # Clamp boundary_pos into a useful range
+        if boundary_pos is None:
+            return
+        if boundary_pos < 0:
+            return
+        if boundary_pos >= len(line):
+            boundary_pos = len(line) - 1
+
+        # Scan left from just before the boundary character
+        i = boundary_pos - 1
+        if i < 0:
+            return
+
+        # Skip any trailing punctuation/spaces before the boundary (rare but safe)
         while i >= 0 and (line[i].isspace() or line[i] in '.,!?;:"()[]{}'):
             i -= 1
         if i < 0:
@@ -547,14 +794,33 @@ class MindPalaceEmulator:
             i -= 1
         start = i + 1
 
+        if start > end:
+            return
+
         word = line[start:end + 1]
-        if word == "i":
-            self.notes[-1] = line[:start] + "I" + line[end + 1:]
+        if word != "i":
+            return
+
+        # Ensure it's a standalone token (not part of a larger word)
+        left_ok = (start == 0) or (not line[start - 1].isalpha())
+        right_ok = (end == len(line) - 1) or (not line[end + 1].isalpha())
+        if not (left_ok and right_ok):
+            return
+
+        self.notes[line_index] = line[:start] + "I" + line[end + 1:]
+
+    def _apply_auto_i_on_boundary(self):
+        # Backward-compatible path for non-typewriter input at end-of-line.
+        if not self.settings["auto_capitalize_i"]:
+            return
+        li = len(self.notes) - 1
+        line = self.notes[li]
+        if not line:
+            return
+        # Last typed boundary is at the end in normal typing
+        self._apply_auto_i_on_boundary_at(li, len(line) - 1)
 
     def _insert_char(self, ch):
-        if self.settings["always_double_quotes"] and ch == "'":
-            ch = '"'
-
         if ch.isalpha() and self._should_autocapitalize_next_letter():
             ch = ch.upper()
 
@@ -564,51 +830,47 @@ class MindPalaceEmulator:
         if ch.isspace() or ch in '.,!?;:"()[]{}':
             self._apply_auto_i_on_boundary()
 
-    # -----------------------
-    # Open menu helpers
-    # -----------------------
-    def _refresh_capsule_list(self):
-        files = []
-        try:
-            for f in os.listdir(CAPSULE_FOLDER):
-                if f.lower().endswith(".txt"):
-                    files.append(f)
-        except Exception:
-            files = []
-        files.sort(key=lambda x: x.lower())
-        self.capsule_files = files
+    def _tw_overwrite_selected(self, ch):
+        # Figure out where we're writing
+        if not self._tw_has_selection():
+            li = len(self.notes) - 1
+            ci = len(self.notes[li])  # insert at end
+            out_ch = ch
+            if out_ch.isalpha() and self._should_autocapitalize_next_letter_at(li, ci):
+                out_ch = out_ch.upper()
 
-    def _display_name_from_filename(self, filename):
-        return os.path.splitext(filename)[0]
+            self.notes[li] += out_ch
+            self._mark_edited()
 
-    # -----------------------
-    # Naming flow (CTRL+S with <4 words)
-    # -----------------------
-    def _start_naming_prompt(self):
-        self.name_buffer = ""
-        self.name_error = ""
-        self.state = "NAMING"
-
-    def _commit_named_save(self):
-        name = self._normalize_display_name(self.name_buffer)
-        if not name:
-            self.name_error = "enter a name"
+            if out_ch.isspace() or out_ch in '.,!?;:"()[]{}':
+                self._apply_auto_i_on_boundary_at(li, len(self.notes[li]) - 1)
             return
 
-        filename = self._unique_filename(name)
-        old_temp = self.temp_filename
+        li = self.tw_sel_line
+        ci = self.tw_sel_char
+        if li is None or ci is None:
+            return
 
-        self.current_filename = filename
-        self.auto_named = True
-        try:
-            self._write_to_file(self.current_filename)
-            self.dirty = False
-            self._remove_file_if_exists(old_temp)
-            self.temp_filename = None
-            self.state = "WRITING"
-            self.name_error = ""
-        except Exception:
-            self._notify_error("save failed.")
+        if li < 0 or li >= len(self.notes):
+            self._tw_clear_selection()
+            return
+
+        line = self.notes[li]
+        if ci < 0 or ci >= len(line):
+            self._tw_clear_selection()
+            return
+
+        out_ch = ch
+        if out_ch.isalpha() and self._should_autocapitalize_next_letter_at(li, ci):
+            out_ch = out_ch.upper()
+
+        self.notes[li] = line[:ci] + out_ch + line[ci + 1:]
+        self._mark_edited()
+
+        if out_ch.isspace() or out_ch in '.,!?;:"()[]{}':
+            self._apply_auto_i_on_boundary_at(li, ci)
+
+        self._tw_move_right()
 
     # -----------------------
     # Wrapping + tracked rendering
@@ -623,24 +885,46 @@ class MindPalaceEmulator:
         w += tracking * max(0, len(s) - 1)
         return w
 
-    def _wrap_lines(self, wrap_px):
+    def _wrap_lines_with_map(self, wrap_px):
         wrapped = []
-        for p in self.notes:
+        mapping = []  # (src_line_index, start_char_in_src, end_char_in_src_exclusive)
+
+        for src_i, p in enumerate(self.notes):
             if p == "":
                 wrapped.append("")
+                mapping.append((src_i, 0, 0))
                 continue
 
-            words = p.split(" ")
+            tokens = p.split(" ")
+            pos = 0
             line = ""
-            for w in words:
-                cand = (w + " ") if not line else (line + w + " ")
+            line_start = 0
+
+            for ti, tok in enumerate(tokens):
+                sep = " " if ti < len(tokens) - 1 else ""
+                tok_with_sep = tok + sep
+
+                cand = tok_with_sep if not line else (line + tok_with_sep)
+
                 if self._text_width(cand.rstrip()) < wrap_px:
+                    if not line:
+                        line_start = pos
                     line = cand
                 else:
-                    wrapped.append(line.rstrip())
-                    line = w + " "
-            wrapped.append(line.rstrip())
-        return wrapped
+                    flush = line.rstrip()
+                    wrapped.append(flush)
+                    mapping.append((src_i, line_start, line_start + len(flush)))
+
+                    line = tok_with_sep
+                    line_start = pos
+
+                pos += len(tok) + (1 if ti < len(tokens) - 1 else 0)
+
+            flush = line.rstrip()
+            wrapped.append(flush)
+            mapping.append((src_i, line_start, line_start + len(flush)))
+
+        return wrapped, mapping
 
     def _render_tracked_line_centered(self, surface, center_x, y, text, color):
         tracking = int(self.settings.get("tracking", 0))
@@ -658,6 +942,64 @@ class MindPalaceEmulator:
             x += glyph.get_width()
             if idx != len(text) - 1:
                 x += tracking
+
+    def _tracked_char_rect_centered(self, center_x, y, text, char_index):
+        if text is None:
+            return None
+        if char_index < 0 or char_index >= len(text):
+            return None
+
+        tracking = int(self.settings.get("tracking", 0))
+        total_w = self._text_width(text)
+        x = center_x - (total_w // 2)
+
+        for idx, ch in enumerate(text):
+            gw = self._glyph_width(ch)
+            if idx == char_index:
+                return pygame.Rect(x, y, gw, self.font_body.get_height())
+            x += gw
+            if idx != len(text) - 1:
+                x += tracking
+        return None
+
+    def _draw_corner_highlight(self, surface, rect):
+        if rect is None:
+            return
+        x, y, w, h = rect.x, rect.y, rect.w, rect.h
+        l = 4
+        c = BLACK
+
+        pygame.draw.line(surface, c, (x, y), (x + l, y), 1)
+        pygame.draw.line(surface, c, (x, y), (x, y + l), 1)
+
+        pygame.draw.line(surface, c, (x + w - l, y), (x + w, y), 1)
+        pygame.draw.line(surface, c, (x + w, y), (x + w, y + l), 1)
+
+        pygame.draw.line(surface, c, (x, y + h), (x + l, y + h), 1)
+        pygame.draw.line(surface, c, (x, y + h - l), (x, y + h), 1)
+
+        pygame.draw.line(surface, c, (x + w - l, y + h), (x + w, y + h), 1)
+        pygame.draw.line(surface, c, (x + w, y + h - l), (x + w, y + h), 1)
+
+    def _maybe_draw_typewriter_selection(self, surface, center_x, y, line_text, src_map):
+        if not self.settings["typewriter_mode"]:
+            return
+        if not self._tw_has_selection():
+            return
+        if not line_text:
+            return
+
+        src_line, start, end = src_map
+        if src_line != self.tw_sel_line:
+            return
+        if self.tw_sel_char is None:
+            return
+        if not (start <= self.tw_sel_char < end):
+            return
+
+        local_index = self.tw_sel_char - start
+        rect = self._tracked_char_rect_centered(center_x, y, line_text, local_index)
+        self._draw_corner_highlight(surface, rect)
 
     # -----------------------
     # Input
@@ -677,6 +1019,7 @@ class MindPalaceEmulator:
                 if event.key == pygame.K_q and (mods & pygame.KMOD_CTRL):
                     self.state = "MENU"
                     self.font_adjust_mode = False
+                    self._tw_clear_selection()
                     return
 
                 # CTRL+F
@@ -709,6 +1052,21 @@ class MindPalaceEmulator:
                 elif self.state == "NAMING":
                     self._nav_naming(event)
                 elif self.state == "WRITING":
+                    # Optional manual nudges (CTRL+arrows) in room mode
+                    if self.settings["room_mode"] and (mods & pygame.KMOD_CTRL):
+                        if event.key == pygame.K_LEFT:
+                            self._adjust_room_view(dyaw=-self.room_yaw_step)
+                            return
+                        if event.key == pygame.K_RIGHT:
+                            self._adjust_room_view(dyaw=+self.room_yaw_step)
+                            return
+                        if event.key == pygame.K_UP:
+                            self._adjust_room_view(dpitch=+self.room_pitch_step)
+                            return
+                        if event.key == pygame.K_DOWN:
+                            self._adjust_room_view(dpitch=-self.room_pitch_step)
+                            return
+
                     if self.font_adjust_mode:
                         if event.key == pygame.K_ESCAPE:
                             self.font_adjust_mode = False
@@ -745,6 +1103,7 @@ class MindPalaceEmulator:
                 self._delete_char()
                 self.backspace_next_repeat = now + interval
 
+        self._update_mouse_look()
         self._maybe_autosave()
 
     # -----------------------
@@ -769,14 +1128,48 @@ class MindPalaceEmulator:
                 self.last_edit_time = 0
                 self.scroll_lines = 0
                 self.font_adjust_mode = False
+                self._tw_clear_selection()
                 self.state = "WRITING"
             elif choice == "open":
                 self._refresh_capsule_list()
                 self.browser_index = 0
+                self.browser_scroll = 0
                 self.state = "BROWSER"
+                self._ensure_browser_index_visible()
             elif choice == "settings":
                 self.settings_index = 0
                 self.state = "SETTINGS"
+
+    def _refresh_capsule_list(self):
+        files = []
+        try:
+            for f in os.listdir(CAPSULE_FOLDER):
+                if f.lower().endswith(".txt"):
+                    files.append(f)
+        except Exception:
+            files = []
+        files.sort(key=lambda x: x.lower())
+        self.capsule_files = files
+
+    def _display_name_from_filename(self, filename):
+        return os.path.splitext(filename)[0]
+
+    def _browser_visible_count(self):
+        usable = EYE_HEIGHT - self.browser_top_y - self.browser_bottom_pad
+        return max(1, usable // self.browser_row_h)
+
+    def _ensure_browser_index_visible(self):
+        if not self.capsule_files:
+            self.browser_scroll = 0
+            return
+        vis = self._browser_visible_count()
+        max_scroll = max(0, len(self.capsule_files) - vis)
+        # keep selected in view
+        if self.browser_index < self.browser_scroll:
+            self.browser_scroll = self.browser_index
+        elif self.browser_index >= self.browser_scroll + vis:
+            self.browser_scroll = self.browser_index - vis + 1
+        self.browser_scroll = max(0, min(max_scroll, self.browser_scroll))
 
     def _nav_browser(self, key):
         if key == pygame.K_ESCAPE:
@@ -784,10 +1177,13 @@ class MindPalaceEmulator:
             return
         if not self.capsule_files:
             return
+
         if key == pygame.K_UP:
             self.browser_index = (self.browser_index - 1) % len(self.capsule_files)
+            self._ensure_browser_index_visible()
         elif key == pygame.K_DOWN:
             self.browser_index = (self.browser_index + 1) % len(self.capsule_files)
+            self._ensure_browser_index_visible()
         elif key == pygame.K_RETURN:
             f = self.capsule_files[self.browser_index]
             try:
@@ -803,6 +1199,7 @@ class MindPalaceEmulator:
                 self.last_edit_time = pygame.time.get_ticks()
                 self.scroll_lines = 0
                 self.font_adjust_mode = False
+                self._tw_clear_selection()
             except Exception:
                 self._notify_error("open failed.")
 
@@ -822,6 +1219,39 @@ class MindPalaceEmulator:
                 return
             self.settings[setting_key] = not self.settings[setting_key]
             self._save_settings()
+            if setting_key == "typewriter_mode":
+                self._tw_clear_selection()
+            if setting_key == "room_mode":
+                self._build_room_static()
+
+    # -----------------------
+    # Naming flow
+    # -----------------------
+    def _start_naming_prompt(self):
+        self.name_buffer = ""
+        self.name_error = ""
+        self.state = "NAMING"
+
+    def _commit_named_save(self):
+        name = self._normalize_display_name(self.name_buffer)
+        if not name:
+            self.name_error = "enter a name"
+            return
+
+        filename = self._unique_filename(name)
+        old_temp = self.temp_filename
+
+        self.current_filename = filename
+        self.auto_named = True
+        try:
+            self._write_to_file(self.current_filename)
+            self.dirty = False
+            self._remove_file_if_exists(old_temp)
+            self.temp_filename = None
+            self.state = "WRITING"
+            self.name_error = ""
+        except Exception:
+            self._notify_error("save failed.")
 
     def _nav_naming(self, event):
         if event.key == pygame.K_ESCAPE:
@@ -842,21 +1272,44 @@ class MindPalaceEmulator:
             if len(self.name_buffer) < 60:
                 self.name_buffer += event.unicode
 
+    # -----------------------
+    # Writing navigation
+    # -----------------------
     def _nav_writing(self, event):
         if event.key == pygame.K_ESCAPE:
             self.state = "MENU"
             self.font_adjust_mode = False
+            self._tw_clear_selection()
             return
 
         if event.key == pygame.K_UP:
-            wrap_px = (self.room_panel_rect.width - 60) if (self.settings["room_mode"] and self.room_panel_rect) else 220
-            total_lines = len(self._wrap_lines(wrap_px))
+            wrap_px = self.hud_panel_rect.width - 50 if self.settings["room_mode"] else 220
+            total_lines = len(self._wrap_lines_with_map(wrap_px)[0])
             max_scroll = max(0, total_lines - 1)
             self.scroll_lines = min(max_scroll, self.scroll_lines + 1)
             return
 
         if event.key == pygame.K_DOWN:
             self.scroll_lines = max(0, self.scroll_lines - 1)
+            return
+
+        if self.settings["typewriter_mode"]:
+            if event.key == pygame.K_LEFT:
+                self._tw_move_left()
+                return
+            if event.key == pygame.K_RIGHT:
+                self._tw_move_right()
+                return
+            if event.key == pygame.K_BACKSPACE:
+                return
+            if event.key == pygame.K_RETURN:
+                self.notes.append("")
+                self._tw_clear_selection()
+                self._mark_edited()
+                return
+            if event.unicode and event.unicode.isprintable():
+                self._tw_overwrite_selected(event.unicode)
+                return
             return
 
         if event.key == pygame.K_BACKSPACE:
@@ -893,11 +1346,17 @@ class MindPalaceEmulator:
                 txt = self.font_body.render("no capsules", True, GRAY)
                 surface.blit(txt, (cx - txt.get_width() // 2, cy))
             else:
-                for i, f in enumerate(self.capsule_files):
+                vis = self._browser_visible_count()
+                start = max(0, min(self.browser_scroll, max(0, len(self.capsule_files) - vis)))
+                end = min(len(self.capsule_files), start + vis)
+
+                y0 = self.browser_top_y
+                for row, i in enumerate(range(start, end)):
+                    f = self.capsule_files[i]
                     display = self._display_name_from_filename(f)
                     color = BLACK if i == self.browser_index else GRAY
                     txt = self.font_body.render(display, True, color)
-                    surface.blit(txt, (cx - txt.get_width() // 2, 50 + i * 25))
+                    surface.blit(txt, (cx - txt.get_width() // 2, y0 + row * self.browser_row_h))
             return
 
         if self.state == "SETTINGS":
@@ -937,31 +1396,29 @@ class MindPalaceEmulator:
                 surface.blit(err, (cx - err.get_width() // 2, cy + 45))
             return
 
-        # WRITING
         if self.state == "WRITING":
             if self.settings["room_mode"]:
-                # Alpha shadow
+                # Fixed HUD panel shadow
                 self.panel_shadow_surf.fill((0, 0, 0, 0))
-                shadow_poly = [(x + 3, y + 6) for (x, y) in self.room_panel_poly]
-                pygame.gfxdraw.filled_polygon(self.panel_shadow_surf, shadow_poly, (0, 0, 0, 26))
-                pygame.gfxdraw.aapolygon(self.panel_shadow_surf, shadow_poly, (0, 0, 0, 26))
+                r = self.hud_panel_rect
+                shadow = r.move(3, 6)
+                pygame.draw.rect(self.panel_shadow_surf, (0, 0, 0, 28), shadow, border_radius=6)
                 surface.blit(self.panel_shadow_surf, (0, 0))
 
-                # Panel quad
-                pygame.gfxdraw.filled_polygon(surface, self.room_panel_poly, (250, 250, 250))
-                pygame.gfxdraw.aapolygon(surface, self.room_panel_poly, (235, 235, 235))
-                pygame.draw.polygon(surface, (235, 235, 235), self.room_panel_poly, width=2)
+                # Fixed HUD panel
+                pygame.draw.rect(surface, (250, 250, 250), r, border_radius=6)
+                pygame.draw.rect(surface, (235, 235, 235), r, width=2, border_radius=6)
 
-                panel_rect = self.room_panel_rect.inflate(-26, -26)
+                panel_rect = r.inflate(-26, -26)
                 prev_clip = surface.get_clip()
                 surface.set_clip(panel_rect)
 
                 cx, cy = panel_rect.centerx, panel_rect.centery
                 wrap_px = max(120, panel_rect.width - 50)
 
-                lines = self._wrap_lines(wrap_px)
+                lines, maps = self._wrap_lines_with_map(wrap_px)
                 if not lines:
-                    lines = [""]
+                    lines, maps = [""], [(0, 0, 0)]
 
                 bottom_index = max(0, len(lines) - 1 - self.scroll_lines)
                 baseline_y = cy + self.typewriter_offset_y
@@ -969,6 +1426,7 @@ class MindPalaceEmulator:
                 y = baseline_y
                 for idx in range(bottom_index, -1, -1):
                     self._render_tracked_line_centered(surface, cx, y, lines[idx], BLACK)
+                    self._maybe_draw_typewriter_selection(surface, cx, y, lines[idx], maps[idx])
                     y -= self.line_height
                     if y < panel_rect.top + 6:
                         break
@@ -977,9 +1435,9 @@ class MindPalaceEmulator:
             else:
                 cx, cy = EYE_WIDTH // 2, EYE_HEIGHT // 2
                 wrap_px = 220
-                lines = self._wrap_lines(wrap_px)
+                lines, maps = self._wrap_lines_with_map(wrap_px)
                 if not lines:
-                    lines = [""]
+                    lines, maps = [""], [(0, 0, 0)]
 
                 bottom_index = max(0, len(lines) - 1 - self.scroll_lines)
                 baseline_y = cy + self.typewriter_offset_y
@@ -987,6 +1445,7 @@ class MindPalaceEmulator:
                 y = baseline_y
                 for idx in range(bottom_index, -1, -1):
                     self._render_tracked_line_centered(surface, cx, y, lines[idx], BLACK)
+                    self._maybe_draw_typewriter_selection(surface, cx, y, lines[idx], maps[idx])
                     y -= self.line_height
                     if y < 0:
                         break
