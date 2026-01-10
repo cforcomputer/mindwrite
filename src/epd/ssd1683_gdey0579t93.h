@@ -32,6 +32,9 @@ public:
     // frame format: row-major, top row first, MSB = left pixel in each byte.
     void show_full_fullscreen(const uint8_t *frame);
 
+    // Partial refresh: writes OLD buffer + NEW buffer, then uses partial update control.
+    void show_partial_fullscreen(const uint8_t *new_frame, const uint8_t *old_frame);
+
     void clear_to_white();
 
     // Busy wait (true = success)
@@ -66,4 +69,5 @@ private:
     void slave_addr_setup_();
 
     void update_full_();
+    void update_partial_();
 };

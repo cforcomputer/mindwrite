@@ -28,38 +28,7 @@ static constexpr uint PIN_MOSI = 19; // SPI0 TX (MOSI)
 
 static constexpr uint32_t SPI_HZ = 20'000'000;
 
-static void blink_status(uint pin, int times, int ms)
-{
-    for (int i = 0; i < times; i++)
-    {
-        gpio_put(pin, 1);
-        sleep_ms(ms);
-        gpio_put(pin, 0);
-        sleep_ms(ms);
-    }
-}
-
-static void make_test_pattern(uint8_t *fb)
-{
-    memset(fb, 0xFF, FRAME_BYTES); // white
-
-    // chunky checkerboard (very obvious if mapping is correct)
-    for (int y = 0; y < EPD_H; ++y)
-    {
-        for (int x = 0; x < EPD_W; ++x)
-        {
-            bool black = (((x / 24) + (y / 24)) % 2) == 0;
-            if (black)
-            {
-                int byte_i = y * BYTES_PER_ROW + (x / 8);
-                int bit = 7 - (x % 8);
-                fb[byte_i] &= ~(1u << bit); // 0 = black
-            }
-        }
-    }
-}
-
-// --- CRC32 (bitwise, dependency-free) ---
+// --- CRC32 (IEEE, bitwise) ---
 static uint32_t crc32_ieee(const uint8_t *data, size_t len)
 {
     uint32_t crc = 0xFFFFFFFFu;
@@ -73,6 +42,14 @@ static uint32_t crc32_ieee(const uint8_t *data, size_t len)
         }
     }
     return ~crc;
+}
+
+static inline uint32_t u32le(const uint8_t b[4])
+{
+    return (uint32_t)b[0] |
+           ((uint32_t)b[1] << 8) |
+           ((uint32_t)b[2] << 16) |
+           ((uint32_t)b[3] << 24);
 }
 
 // Read exactly n bytes from USB CDC via getchar_timeout_us.
@@ -100,18 +77,29 @@ static bool read_exact(uint8_t *dst, size_t n, uint32_t timeout_ms)
 
 static inline void send_ok()
 {
-    // Clean 2-byte ACK; no newline.
     putchar_raw('O');
     putchar_raw('K');
     stdio_flush();
 }
 
-static inline uint32_t u32le(const uint8_t b[4])
+static void make_test_pattern(uint8_t *fb)
 {
-    return (uint32_t)b[0] |
-           ((uint32_t)b[1] << 8) |
-           ((uint32_t)b[2] << 16) |
-           ((uint32_t)b[3] << 24);
+    memset(fb, 0xFF, FRAME_BYTES); // white
+
+    // chunky checkerboard
+    for (int y = 0; y < EPD_H; ++y)
+    {
+        for (int x = 0; x < EPD_W; ++x)
+        {
+            bool black = (((x / 24) + (y / 24)) % 2) == 0;
+            if (black)
+            {
+                int byte_i = y * BYTES_PER_ROW + (x / 8);
+                int bit = 7 - (x % 8);
+                fb[byte_i] &= ~(1u << bit);
+            }
+        }
+    }
 }
 
 int main()
@@ -124,12 +112,9 @@ int main()
     gpio_set_dir(LED_PIN, GPIO_OUT);
     gpio_put(LED_PIN, 0);
 
-    // Keep prints minimal. Anything you print can appear in the same stream the PC reads.
     printf("mindwrite_epd_stream boot\n");
     stdio_flush();
 
-    // NOTE: match your driver constructor signature.
-    // If your header requires an extra bool, keep it. If not, remove it.
     SSD1683_GDEY0579T93 epd(
         spi0,
         PIN_CS, PIN_DC, PIN_RST, PIN_BUSY,
@@ -138,11 +123,10 @@ int main()
 
     epd.init(SPI_HZ);
 
-    // Boot pattern once (proves display works independent of streaming)
-    static uint8_t boot_fb[FRAME_BYTES];
-    make_test_pattern(boot_fb);
-    epd.show_full_fullscreen(boot_fb);
-    blink_status(LED_PIN, 2, 80);
+    // Boot pattern (full refresh) once
+    static uint8_t prev_frame[FRAME_BYTES];
+    make_test_pattern(prev_frame);
+    epd.show_full_fullscreen(prev_frame);
 
     // Streaming buffer
     static uint8_t frame[FRAME_BYTES];
@@ -152,7 +136,6 @@ int main()
 
     while (true)
     {
-        // Shift in bytes until we match "MWF1"
         int c = getchar_timeout_us(1000);
         if (c < 0)
         {
@@ -168,19 +151,25 @@ int main()
         if (!(sync[0] == 'M' && sync[1] == 'W' && sync[2] == 'F' && sync[3] == '1'))
             continue;
 
-        // Read length (4), payload (len), crc (4)
+        // length
         uint8_t len_b[4];
         if (!read_exact(len_b, 4, 2000))
             continue;
 
         uint32_t len = u32le(len_b);
-        if (len != (uint32_t)FRAME_BYTES)
+
+        // We support:
+        // - legacy: len == FRAME_BYTES (payload = frame)
+        // - new:    len == FRAME_BYTES + 1 (payload = flags + frame)
+        uint8_t flags = 0;
+
+        if (len != (uint32_t)FRAME_BYTES && len != (uint32_t)(FRAME_BYTES + 1))
         {
-            // wrong length -> drop frame, resync
-            continue;
+            continue; // resync
         }
 
-        if (!read_exact(frame, FRAME_BYTES, 5000))
+        static uint8_t payload_buf[FRAME_BYTES + 1];
+        if (!read_exact(payload_buf, len, 8000))
             continue;
 
         uint8_t crc_b[4];
@@ -188,17 +177,38 @@ int main()
             continue;
 
         uint32_t want_crc = u32le(crc_b);
-        uint32_t got_crc = crc32_ieee(frame, FRAME_BYTES);
+        uint32_t got_crc = crc32_ieee(payload_buf, len);
         if (want_crc != got_crc)
-        {
-            // bad frame -> ignore, resync
-            blink_status(LED_PIN, 2, 40);
             continue;
+
+        const uint8_t *frame_ptr = nullptr;
+        if (len == (uint32_t)FRAME_BYTES)
+        {
+            flags = 0; // legacy defaults to partial
+            frame_ptr = payload_buf;
+        }
+        else
+        {
+            flags = payload_buf[0];
+            frame_ptr = payload_buf + 1;
         }
 
-        // Full refresh (slow). When done, ACK OK so host paces itself.
-        epd.show_full_fullscreen(frame);
+        memcpy(frame, frame_ptr, FRAME_BYTES);
+
+        const bool force_full = (flags & 0x01u) != 0;
+
+        if (force_full)
+        {
+            epd.show_full_fullscreen(frame);
+        }
+        else
+        {
+            epd.show_partial_fullscreen(frame, prev_frame);
+        }
+
+        memcpy(prev_frame, frame, FRAME_BYTES);
+
         send_ok();
-        blink_status(LED_PIN, 1, 20);
+        gpio_put(LED_PIN, !gpio_get(LED_PIN));
     }
 }

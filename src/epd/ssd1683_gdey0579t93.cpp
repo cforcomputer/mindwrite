@@ -85,17 +85,29 @@ void SSD1683_GDEY0579T93::update_full_()
     wait_idle(20000);
 }
 
+void SSD1683_GDEY0579T93::update_partial_()
+{
+    // Vendor partial update control (matches the pattern in the Arduino demo)
+    cmd_(0x22);
+    data_(0xFF);
+    cmd_(0x20);
+    wait_idle(20000);
+}
+
 void SSD1683_GDEY0579T93::init(uint32_t spi_hz)
 {
     gpio_init(cs_);
     gpio_set_dir(cs_, GPIO_OUT);
     gpio_put(cs_, 1);
+
     gpio_init(dc_);
     gpio_set_dir(dc_, GPIO_OUT);
     gpio_put(dc_, 0);
+
     gpio_init(rst_);
     gpio_set_dir(rst_, GPIO_OUT);
     gpio_put(rst_, 1);
+
     gpio_init(busy_);
     gpio_set_dir(busy_, GPIO_IN);
 
@@ -110,7 +122,6 @@ void SSD1683_GDEY0579T93::init(uint32_t spi_hz)
     cmd_(0x12); // SWRESET
     wait_idle(5000);
 
-    // Match common SSD1683 init bits used by demos
     cmd_(0x3C); // Border waveform
     data_(0x80);
 
@@ -124,7 +135,7 @@ void SSD1683_GDEY0579T93::init(uint32_t spi_hz)
 void SSD1683_GDEY0579T93::master_addr_setup_()
 {
     cmd_(0x11);  // Data entry mode
-    data_(0x05); // Y decrement, X increment (this is what makes vendor loop work)
+    data_(0x05); // Y decrement, X increment
 
     cmd_(0x44); // X window
     data_(0x00);
@@ -177,7 +188,7 @@ void SSD1683_GDEY0579T93::clear_to_white()
 
 void SSD1683_GDEY0579T93::show_full_fullscreen(const uint8_t *frame)
 {
-    if (!inited_)
+    if (!inited_ || !frame)
         return;
 
     // -------- MASTER --------
@@ -185,10 +196,6 @@ void SSD1683_GDEY0579T93::show_full_fullscreen(const uint8_t *frame)
     wait_idle(5000);
 
     cmd_(0x24);
-
-    // Vendor controller expects column-major writes with Y decrement starting at 271.
-    // Our payload is row-major top->bottom, so we flip Y when reading:
-    // src_row = (HEIGHT - 1 - y)
     for (int col = 0; col < MASTER_COLS; ++col)
     {
         for (int y = 0; y < HEIGHT; ++y)
@@ -199,7 +206,7 @@ void SSD1683_GDEY0579T93::show_full_fullscreen(const uint8_t *frame)
         }
     }
 
-    cmd_(0x26); // "old" buffer used by some update modes; keep cleared
+    cmd_(0x26); // old buffer (clear)
     for (int i = 0; i < MASTER_COLS * HEIGHT; ++i)
         data_(0x00);
 
@@ -208,9 +215,6 @@ void SSD1683_GDEY0579T93::show_full_fullscreen(const uint8_t *frame)
     wait_idle(5000);
 
     cmd_(0xA4);
-
-    // Slave consumes 50 columns starting at overlap column 49:
-    // columns 49..98 (inclusive) = 50 bytes
     for (int col = SLAVE_START; col < SLAVE_START + SLAVE_COLS; ++col)
     {
         for (int y = 0; y < HEIGHT; ++y)
@@ -221,9 +225,79 @@ void SSD1683_GDEY0579T93::show_full_fullscreen(const uint8_t *frame)
         }
     }
 
-    cmd_(0xA6);
+    cmd_(0xA6); // old buffer (clear)
     for (int i = 0; i < SLAVE_COLS * HEIGHT; ++i)
         data_(0x00);
 
     update_full_();
+}
+
+void SSD1683_GDEY0579T93::show_partial_fullscreen(const uint8_t *new_frame, const uint8_t *old_frame)
+{
+    if (!inited_ || !new_frame || !old_frame)
+        return;
+
+    // Optional vendor "partial pre-step" (seen in Arduino EPD_Dis_Part_*):
+    cmd_(0x22);
+    data_(0xC0);
+    cmd_(0x20);
+    wait_idle(5000);
+
+    // -------- MASTER --------
+    master_addr_setup_();
+    wait_idle(5000);
+
+    // OLD -> 0x26
+    cmd_(0x26);
+    for (int col = 0; col < MASTER_COLS; ++col)
+    {
+        for (int y = 0; y < HEIGHT; ++y)
+        {
+            int src_row = (HEIGHT - 1 - y);
+            uint8_t b = old_frame[src_row * BYTES_PER_ROW + col];
+            data_(xform_(b));
+        }
+    }
+
+    // NEW -> 0x24
+    cmd_(0x24);
+    for (int col = 0; col < MASTER_COLS; ++col)
+    {
+        for (int y = 0; y < HEIGHT; ++y)
+        {
+            int src_row = (HEIGHT - 1 - y);
+            uint8_t b = new_frame[src_row * BYTES_PER_ROW + col];
+            data_(xform_(b));
+        }
+    }
+
+    // -------- SLAVE --------
+    slave_addr_setup_();
+    wait_idle(5000);
+
+    // OLD -> 0xA6
+    cmd_(0xA6);
+    for (int col = SLAVE_START; col < SLAVE_START + SLAVE_COLS; ++col)
+    {
+        for (int y = 0; y < HEIGHT; ++y)
+        {
+            int src_row = (HEIGHT - 1 - y);
+            uint8_t b = old_frame[src_row * BYTES_PER_ROW + col];
+            data_(xform_(b));
+        }
+    }
+
+    // NEW -> 0xA4
+    cmd_(0xA4);
+    for (int col = SLAVE_START; col < SLAVE_START + SLAVE_COLS; ++col)
+    {
+        for (int y = 0; y < HEIGHT; ++y)
+        {
+            int src_row = (HEIGHT - 1 - y);
+            uint8_t b = new_frame[src_row * BYTES_PER_ROW + col];
+            data_(xform_(b));
+        }
+    }
+
+    update_partial_();
 }
