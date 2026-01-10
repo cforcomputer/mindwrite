@@ -17,9 +17,9 @@ public:
 
     // Master is 400px (50 bytes), Slave is 400px (50 bytes) with a 1-byte overlap
     // so 50 + 50 - 1 = 99 bytes total (792px).
-    static constexpr int MASTER_COLS = 50; // bytes
-    static constexpr int SLAVE_COLS = 50;  // bytes
-    static constexpr int SLAVE_START = 49; // overlap byte index
+    static constexpr int MASTER_COLS = 50; // bytes (global cols 0..49)
+    static constexpr int SLAVE_COLS = 50;  // bytes (slave internal 0x31..0x00)
+    static constexpr int SLAVE_START = 49; // overlap byte index (global col 49)
 
     SSD1683_GDEY0579T93(spi_inst_t *spi,
                         uint pin_cs, uint pin_dc, uint pin_rst, uint pin_busy,
@@ -32,8 +32,17 @@ public:
     // frame format: row-major, top row first, MSB = left pixel in each byte.
     void show_full_fullscreen(const uint8_t *frame);
 
-    // Partial refresh: writes OLD buffer + NEW buffer, then uses partial update control.
+    // Fullscreen partial (still writes full framebuffer but uses partial update waveform)
+    // new_frame/old_frame are full 792x272 row-major 1bpp.
     void show_partial_fullscreen(const uint8_t *new_frame, const uint8_t *old_frame);
+
+    // Smart partial window:
+    // - (x,y,w,h) in pixels, MUST be byte-aligned on x and w (multiples of 8).
+    // - rect_new is row-major for just the rectangle: width_bytes = w/8, height = h.
+    // - old_full is the previous full framebuffer (792x272 row-major) used to fill OLD buffer.
+    void show_partial_window(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
+                             const uint8_t *rect_new,
+                             const uint8_t *old_full);
 
     void clear_to_white();
 
@@ -68,6 +77,26 @@ private:
     void master_addr_setup_();
     void slave_addr_setup_();
 
+    // Window setup helpers
+    void master_window_(uint8_t x_start, uint8_t x_end, uint16_t y_top, uint16_t y_bottom);
+    void slave_window_(uint8_t slave_x_start, uint8_t slave_x_end, uint16_t y_top, uint16_t y_bottom);
+
+    // Update triggers
     void update_full_();
     void update_partial_();
+
+    // Write a master/slave window from rect_new (NEW) and old_full (OLD)
+    void write_master_window_new_old_(uint8_t x_start, uint8_t x_end,
+                                      uint16_t y_top, uint16_t y_bottom,
+                                      uint16_t rect_xb, uint16_t rect_y,
+                                      uint16_t rect_wb,
+                                      const uint8_t *rect_new,
+                                      const uint8_t *old_full);
+
+    void write_slave_window_new_old_(uint8_t gcol_start, uint8_t gcol_end,
+                                     uint16_t y_top, uint16_t y_bottom,
+                                     uint16_t rect_xb, uint16_t rect_y,
+                                     uint16_t rect_wb,
+                                     const uint8_t *rect_new,
+                                     const uint8_t *old_full);
 };
