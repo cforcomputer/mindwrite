@@ -13,10 +13,14 @@
 #
 # Fix in this revision:
 # - FIXED "thin beautiful typewriter text" vs "missing vertical strokes" tradeoff:
-#   We render text with AA ON to get a nice glyph shape, then immediately convert it
-#   to a *binary alpha* surface using the glyph's alpha coverage (NOT luminance).
-#   The final composed frame is strictly black/white again, so the 1bpp pack is stable
-#   and vertical strokes do not disappear.
+#   Render AA glyphs, then convert to binary alpha coverage (no grays in final).
+#
+# Fix in this revision:
+# - Writing view layout:
+#   * ONLY the current (bottom) line is typewriter-centered (end at cx).
+#   * Lines above are left-aligned and use full per-line circle width.
+#   * Wrapping is circle-aware per-line Y so text never gets clipped by the mask.
+#   * Very long words are split so text is always visible.
 #
 # Other behavior preserved:
 # - Very responsive: repack 1bpp only when the frame changes (needs_redraw).
@@ -43,6 +47,10 @@ import re
 import struct
 import sys
 import time
+import math
+import threading
+import queue
+
 
 import pygame
 
@@ -77,8 +85,11 @@ STREAM_MIRROR_X = True
 
 # Text binarization from AA glyph alpha:
 # Lower = thinner (but risk holes), higher = bolder.
-# Typical sweet spot for small mono fonts is ~18..40.
 TEXT_ALPHA_CUTOFF = 26
+
+# Circle text margins
+CIRCLE_TEXT_MARGIN_X = 4
+CIRCLE_TEXT_MARGIN_Y = 6
 
 # Try to get a typewriter-like mono font if installed; fallback to default.
 PREFERRED_MONO_FONTS = [
@@ -228,20 +239,13 @@ class MindPalaceEmulator:
         # Settings (persisted)
         self.settings = {
             "typewriter_mode": False,
-            # Per-eye circle offsets (moves each circle center)
             "ipd_left_px": 0,
             "ipd_right_px": 0,
-            # Circle radius (lens FOV)
             "circle_radius_px": 110,
-            # Vertical alignment (lens center)
             "center_y_offset_px": 0,
-            # Font size inside circles
             "circle_font_size": 12,
-            # Tracking between glyphs
             "tracking": 1,
-            # UI invert mode (background black, text white)
             "invert_ui": False,
-            # Optional
             "auto_capitalize_i": False,
             "autocap_after_period": False,
         }
@@ -270,6 +274,7 @@ class MindPalaceEmulator:
         # Glyph cache (for fast tracked rendering)
         self._glyph_surf = {}
         self._glyph_w = {}
+        self._glyph_adv = {}  # <-- ADD THIS
 
         self._apply_font_settings()
 
@@ -332,14 +337,28 @@ class MindPalaceEmulator:
         # Performance: redraw only when needed
         self.needs_redraw = True
 
-        # Circle masks: binary (no gray edges) so no “black ring”
+        # Circle masks: binary (no gray edges)
         self._mask_left: pygame.Surface | None = None
         self._mask_right: pygame.Surface | None = None
         self._mask_params_left = None
         self._mask_params_right = None
 
+        # --- ADD: Streaming thread plumbing (UI must never block on ACK/refresh) ---
+        import queue
+        import threading
+
+        self._tx_q: "queue.Queue[tuple[bytes, bool]]" = queue.Queue(maxsize=1)
+        self._tx_stop = threading.Event()
+        self._tx_thread = None
+        # ------------------------------------------------------------------------
+
         if self.stream_enabled:
             self._connect_serial()
+            # --- ADD: start worker only if serial actually connected ---
+            if self.stream_enabled and self.ser is not None:
+                self._tx_thread = threading.Thread(target=self._tx_worker, daemon=True)
+                self._tx_thread.start()
+            # ---------------------------------------------------------
 
     # -----------------------
     # Colors (pure BW)
@@ -351,26 +370,18 @@ class MindPalaceEmulator:
         return (255, 255, 255) if self.settings.get("invert_ui", False) else (0, 0, 0)
 
     # -----------------------
-    # Text rendering: AA -> binary alpha (so final frame is still 1-bit clean)
+    # Text rendering: AA -> binary alpha
     # -----------------------
     def _render_text_binary_alpha(
         self, font: pygame.font.Font, text: str
     ) -> pygame.Surface:
-        """
-        Render text with AA to get a nice glyph shape, then convert to *binary alpha* using
-        the glyph coverage (alpha channel). This produces thin, clean text without grays,
-        and avoids the "AA makes vertical lines disappear after threshold" problem.
-        """
         fg = self._fg()
 
-        # If numpy isn't available, fall back to the old non-AA path (still functional).
         if np is None:
             return font.render(text, False, fg)
 
         aa = font.render(text, True, fg).convert_alpha()
-
-        # Convert AA coverage to binary coverage.
-        a = pygame.surfarray.array_alpha(aa)  # shape (w,h)
+        a = pygame.surfarray.array_alpha(aa)  # (w,h)
         mask = a >= int(TEXT_ALPHA_CUTOFF)
 
         out = pygame.Surface(aa.get_size(), pygame.SRCALPHA).convert_alpha()
@@ -379,7 +390,6 @@ class MindPalaceEmulator:
         alpha_view = pygame.surfarray.pixels_alpha(out)  # (w,h)
         alpha_view[:, :] = np.where(mask, 255, 0).astype(np.uint8)
         del alpha_view
-
         return out
 
     # -----------------------
@@ -470,9 +480,53 @@ class MindPalaceEmulator:
         try:
             if self.ser is not None:
                 self.ser.close()
+                self._tx_stop.set()
         except Exception:
             pass
         self.ser = None
+
+    def _tx_worker(self):
+        """
+        Runs in background. Safe to block on ACK without freezing UI.
+        Only the latest frame is kept (queue maxsize=1).
+        """
+        while not self._tx_stop.is_set():
+            try:
+                fb, force_full = self._tx_q.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            if not self.stream_enabled or self.ser is None:
+                continue
+
+            flags = 0x01 if force_full else 0x00
+            payload = bytes([flags]) + fb
+            pkt = build_packet(payload)
+
+            try:
+                waiting = getattr(self.ser, "in_waiting", 0)
+                if waiting:
+                    self.ser.read(waiting)
+            except Exception:
+                pass
+
+            try:
+                self.ser.write(pkt)
+                self.ser.flush()
+            except Exception:
+                # Don’t crash worker; just stop streaming
+                self.stream_enabled = False
+                continue
+
+            # This is the blocking part — now safely off the UI thread
+            ok = wait_for_ok(self.ser, self.ack_timeout)
+            if not ok:
+                # You can keep streaming anyway, or disable. Your choice:
+                # self.stream_enabled = False
+                try:
+                    self.ser.reset_input_buffer()
+                except Exception:
+                    pass
 
     # -----------------------
     # Fonts + glyph cache
@@ -496,14 +550,19 @@ class MindPalaceEmulator:
 
         self.line_height = int(body_size * 1.25) + 6
 
-        # Glyph cache: use AA->binary-alpha so strokes are thin but final frame remains BW.
         self._glyph_surf.clear()
         self._glyph_w.clear()
+        self._glyph_adv.clear()  # <-- ADD THIS
+
         for code in range(32, 127):
             ch = chr(code)
             s = self._render_text_binary_alpha(self.font_body, ch)
             self._glyph_surf[ch] = s
             self._glyph_w[ch] = s.get_width()
+
+            # IMPORTANT: advance width, not bounding-box width
+            # This is what prevents letters like "ll" / "in" from collapsing together.
+            self._glyph_adv[ch] = self.font_body.size(ch)[0]
 
         self.needs_redraw = True
 
@@ -516,10 +575,12 @@ class MindPalaceEmulator:
         return s
 
     def _glyph_width(self, ch: str) -> int:
-        w = self._glyph_w.get(ch)
-        if w is None:
-            w = self._glyph(ch).get_width()
-        return w
+        # Use the *advance* width, not the rendered surface width.
+        adv = self._glyph_adv.get(ch)
+        if adv is None:
+            adv = self.font_body.size(ch)[0]
+            self._glyph_adv[ch] = adv
+        return adv
 
     def _text_width(self, s: str) -> int:
         tracking = int(self.settings.get("tracking", 0))
@@ -538,7 +599,10 @@ class MindPalaceEmulator:
         for idx, ch in enumerate(text):
             glyph = self._glyph(ch)
             surface.blit(glyph, (x, y))
-            x += glyph.get_width()
+
+            # Advance by font advance, not glyph surface width
+            x += self._glyph_width(ch)
+
             if idx != len(text) - 1:
                 x += tracking
 
@@ -551,41 +615,6 @@ class MindPalaceEmulator:
         total_w = self._text_width(text)
         x = center_x - total_w
         self._render_tracked_line(surface, x, y, text)
-
-    # -----------------------
-    # Wrapping
-    # -----------------------
-    def _wrap_width_for_circle(self) -> int:
-        r = int(self.settings["circle_radius_px"])
-        wrap_px = int((2 * r) * 0.80)
-        wrap_px = max(80, min(EYE_WIDTH - 20, wrap_px))
-        return wrap_px
-
-    def _wrap_lines(self, wrap_px: int):
-        wrapped = []
-
-        for p in self.notes:
-            if p == "":
-                wrapped.append("")
-                continue
-
-            tokens = p.split(" ")
-            line = ""
-
-            for ti, tok in enumerate(tokens):
-                sep = " " if ti < len(tokens) - 1 else ""
-                tok_with_sep = tok + sep
-                cand = tok_with_sep if not line else (line + tok_with_sep)
-
-                if self._text_width(cand.rstrip()) <= wrap_px:
-                    line = cand
-                else:
-                    wrapped.append(line.rstrip())
-                    line = tok_with_sep
-
-            wrapped.append(line.rstrip())
-
-        return wrapped
 
     # -----------------------
     # Messages
@@ -770,7 +799,7 @@ class MindPalaceEmulator:
             self._apply_auto_i_on_boundary()
 
     # -----------------------
-    # Circle geometry + binary masks (no gray edges)
+    # Circle geometry + binary masks
     # -----------------------
     def _circle_center_for_eye(self, eye: str):
         self._sanitize_settings()
@@ -794,12 +823,8 @@ class MindPalaceEmulator:
     def _build_binary_circle_mask(
         self, w: int, h: int, cx: int, cy: int, r: int
     ) -> pygame.Surface:
-        """
-        Returns an RGBA surface where alpha is strictly 0 or 255 (no AA edge).
-        Mask RGB is white; alpha=255 inside circle, alpha=0 outside.
-        """
         mask = pygame.Surface((w, h), pygame.SRCALPHA).convert_alpha()
-        mask.fill((255, 255, 255, 0))  # white RGB, transparent alpha
+        mask.fill((255, 255, 255, 0))
 
         if np is not None:
             y, x = np.ogrid[:h, :w]
@@ -855,6 +880,172 @@ class MindPalaceEmulator:
         tmp.blit(src_rgb, (0, 0))
         tmp.blit(mask_rgba, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
         dst_rgb.blit(tmp, (0, 0))
+
+    # -----------------------
+    # Circle-aware text bounds + wrapping for writing view
+    # -----------------------
+    def _circle_x_bounds_for_line(
+        self, cx: int, cy: int, r: int, y_top: int
+    ) -> tuple[int, int] | None:
+        """
+        Returns (x_left, x_right) bounds for a text line whose top is y_top,
+        using the circle cross-section at the line's vertical mid.
+        """
+        mid_y = y_top + (self.line_height // 2)
+        dy = mid_y - cy
+        if abs(dy) >= r:
+            return None
+        inside = (r * r) - (dy * dy)
+        if inside <= 0:
+            return None
+        half = int(math.isqrt(inside))
+        x_left = cx - half + CIRCLE_TEXT_MARGIN_X
+        x_right = cx + half - CIRCLE_TEXT_MARGIN_X
+        if x_right <= x_left + 6:
+            return None
+        return x_left, x_right
+
+    def _fit_suffix_to_width(self, s: str, max_w: int) -> tuple[str, str]:
+        """
+        Split s into (prefix_remaining, suffix_that_fits) where suffix_that_fits is the
+        longest suffix of s that fits max_w. Used so very long tokens never get clipped.
+        """
+        if not s:
+            return "", ""
+        if self._text_width(s) <= max_w:
+            return "", s
+
+        lo = 1
+        hi = len(s)
+        best = 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            cand = s[-mid:]
+            if self._text_width(cand) <= max_w:
+                best = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+
+        suffix = s[-best:]
+        prefix = s[:-best]
+        return prefix, suffix
+
+    def _build_visible_lines_circle_aware(
+        self, cx: int, cy: int, r: int, baseline_y: int
+    ) -> list[str]:
+        """
+        Build lines bottom-up using per-line circle width.
+        Index 0 is the bottom line (current typing line region).
+        """
+
+        # Prepare mutable segments so we can split long words for display without touching self.notes.
+        segments: list[list[str]] = []
+        for ln in self.notes:
+            if ln == "":
+                segments.append([])
+            else:
+                segments.append(ln.split(" "))
+
+        seg_i = len(segments) - 1
+        word_i = len(segments[seg_i]) if seg_i >= 0 else 0
+
+        top_limit = cy - r + CIRCLE_TEXT_MARGIN_Y
+        max_visible = max(1, (baseline_y - top_limit) // max(1, self.line_height) + 1)
+
+        # We build extra lines to support scroll_lines.
+        need = max_visible + max(0, int(self.scroll_lines))
+
+        out: list[str] = []
+        for line_idx in range(need):
+            y = baseline_y - line_idx * self.line_height
+            if y < top_limit:
+                break
+
+            bounds = self._circle_x_bounds_for_line(cx, cy, r, y)
+            if bounds is None:
+                out.append("")
+                continue
+
+            x_left, x_right = bounds
+
+            # Bottom line is typewriter-centered: it ends at cx.
+            if line_idx == 0:
+                max_w = max(10, cx - x_left)
+            else:
+                max_w = max(10, x_right - x_left)
+
+            # If we ran out of segments, pad blanks.
+            if seg_i < 0:
+                out.append("")
+                continue
+
+            # Handle explicit blank lines (paragraph breaks).
+            if segments[seg_i] == [] and word_i == 0:
+                out.append("")
+                seg_i -= 1
+                if seg_i >= 0:
+                    word_i = len(segments[seg_i])
+                continue
+
+            # Normal line build
+            rev_words: list[str] = []
+            emitted = False
+
+            while seg_i >= 0:
+                # paragraph boundary
+                if segments[seg_i] == []:
+                    break
+
+                # no more words in this segment
+                if word_i <= 0:
+                    break
+
+                w = segments[seg_i][word_i - 1]
+
+                if not rev_words:
+                    cand = w
+                else:
+                    cand = w + " " + " ".join(reversed(rev_words))
+
+                if self._text_width(cand) <= max_w:
+                    rev_words.append(w)
+                    word_i -= 1
+                    continue
+
+                # If nothing fits yet, split a long word so it never clips.
+                if not rev_words:
+                    prefix, suffix = self._fit_suffix_to_width(w, max_w)
+                    if suffix:
+                        out.append(suffix)
+                        emitted = True
+
+                        # keep the prefix to be consumed on the next line up
+                        segments[seg_i][word_i - 1] = prefix
+                        if segments[seg_i][word_i - 1] == "":
+                            word_i -= 1
+                        break
+                    else:
+                        out.append("")
+                        emitted = True
+                        break
+
+                # Otherwise finalize this line (we already have some words)
+                out.append(" ".join(reversed(rev_words)))
+                emitted = True
+                break
+
+            # If we got here without emitting a line, emit whatever we collected (or blank).
+            if not emitted:
+                out.append(" ".join(reversed(rev_words)) if rev_words else "")
+
+            # If we consumed the whole segment, move to previous.
+            if seg_i >= 0 and segments[seg_i] != [] and word_i == 0:
+                seg_i -= 1
+                if seg_i >= 0:
+                    word_i = len(segments[seg_i])
+
+        return out
 
     # -----------------------
     # Input handling
@@ -1178,10 +1369,8 @@ class MindPalaceEmulator:
             return
 
         if event.key == pygame.K_UP:
-            wrap_px = self._wrap_width_for_circle()
-            total_lines = len(self._wrap_lines(wrap_px))
-            max_scroll = max(0, total_lines - 1)
-            self.scroll_lines = min(max_scroll, self.scroll_lines + 1)
+            # Keep original behavior; scroll_lines is interpreted by the circle-aware renderer.
+            self.scroll_lines = max(0, self.scroll_lines + 1)
             self.needs_redraw = True
             return
 
@@ -1328,24 +1517,51 @@ class MindPalaceEmulator:
             err = self._render_text_binary_alpha(self.font_ui, self.name_error)
             surface.blit(err, (cx - err.get_width() // 2, cy + 42))
 
-    def _render_writing_typewriter_center(self, surface, cx, cy):
+    def _render_writing_typewriter_center(self, surface, cx, cy, r):
+        """
+        Bottom line: typewriter-centered (end at cx).
+        Lines above: left-aligned and fill per-line circle width.
+        Wrapping is circle-aware per line Y so it never clips past the mask.
+        """
         surface.fill(self._bg())
-
-        wrap_px = self._wrap_width_for_circle()
-        lines = self._wrap_lines(wrap_px)
-        if not lines:
-            lines = [""]
-
-        bottom_index = max(0, len(lines) - 1 - self.scroll_lines)
 
         baseline_y = cy + 8
 
+        # Build bottom-up lines, then apply scroll by skipping newest lines.
+        all_lines_bottom_up = self._build_visible_lines_circle_aware(
+            cx, cy, r, baseline_y
+        )
+        if not all_lines_bottom_up:
+            all_lines_bottom_up = [""]
+
+        # Visible slice: skip newest lines when scrolling up.
+        start = max(0, int(self.scroll_lines))
+        visible = all_lines_bottom_up[start:]
+
+        # Render from bottom up until we run out of space.
         y = baseline_y
-        for idx in range(bottom_index, -1, -1):
-            self._render_tracked_line_typewriter_center(surface, cx, y, lines[idx])
-            y -= self.line_height
-            if y < 0:
+        top_limit = cy - r + CIRCLE_TEXT_MARGIN_Y
+
+        for i, line in enumerate(visible):
+            if y < top_limit:
                 break
+
+            bounds = self._circle_x_bounds_for_line(cx, cy, r, y)
+            if bounds is None:
+                y -= self.line_height
+                continue
+
+            x_left, x_right = bounds
+
+            # Only if not scrolled and this is the true newest line: typewriter-center.
+            if start == 0 and i == 0:
+                # Ensure it stays visible inside bounds (it should, due to wrap builder).
+                self._render_tracked_line_typewriter_center(surface, cx, y, line)
+            else:
+                # Left align inside circle for "page fill" behavior.
+                self._render_tracked_line(surface, x_left, y, line)
+
+            y -= self.line_height
 
     def _should_draw_circle_outline(self) -> bool:
         if self.state != "SETTINGS":
@@ -1365,7 +1581,7 @@ class MindPalaceEmulator:
         elif self.state == "NAMING":
             self._render_naming_centered(eye_surface, cx, cy)
         elif self.state == "WRITING":
-            self._render_writing_typewriter_center(eye_surface, cx, cy)
+            self._render_writing_typewriter_center(eye_surface, cx, cy, r)
         else:
             eye_surface.fill(self._bg())
 
@@ -1402,40 +1618,19 @@ class MindPalaceEmulator:
             fb = pack_1bpp_fast(stream_src, invert=self.invert_stream)
             self._cached_fb_bytes = fb
 
-        if (not self.force_full_next) and (self._last_sent_fb == fb):
-            self._next_send_time = now + (1.0 / self.send_fps)
-            return
-
-        flags = 0x01 if self.force_full_next else 0x00
-        payload = bytes([flags]) + fb
-        pkt = build_packet(payload)
-
+        # Keep only the newest frame in the queue (drop older one)
         try:
-            waiting = getattr(self.ser, "in_waiting", 0)
-            if waiting:
-                self.ser.read(waiting)
+            while True:
+                self._tx_q.get_nowait()
         except Exception:
             pass
 
         try:
-            self.ser.write(pkt)
-            self.ser.flush()
+            self._tx_q.put_nowait((fb, self.force_full_next))
+            self.force_full_next = False
         except Exception:
-            self._notify_error("serial write failed")
-            self._disconnect_serial()
-            self.stream_enabled = False
-            return
+            pass
 
-        ok = wait_for_ok(self.ser, self.ack_timeout)
-        if not ok:
-            self._notify_error("ACK timeout")
-            try:
-                self.ser.reset_input_buffer()
-            except Exception:
-                pass
-
-        self._last_sent_fb = fb
-        self.force_full_next = False
         self._next_send_time = now + (1.0 / self.send_fps)
 
     # -----------------------
